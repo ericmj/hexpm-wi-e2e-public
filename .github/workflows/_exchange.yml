@@ -1,0 +1,33 @@
+name: _exchange
+
+on:
+  workflow_call:
+    inputs:
+      expect:
+        type: string
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  exchange:
+    runs-on: ubuntu-latest
+    env:
+      HEX_API_URL: https://staging.hex.pm/api
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: T5 exchange from a reusable workflow, expecting ${{ inputs.expect }}
+        run: |
+          . scripts/wi.sh
+          echo "workflow_ref and job_workflow_ref differ here; hexpm reads the filename from workflow_ref"
+          oidc o; exchange package:hexpm/wi_e2e_public o t
+          if [ "${{ inputs.expect }}" = 200 ]; then
+            expect 200
+          else
+            expect 403 access_denied "No matching workload identity"
+          fi

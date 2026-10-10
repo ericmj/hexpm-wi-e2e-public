@@ -1,0 +1,24 @@
+name: other
+
+on: workflow_dispatch
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  HEX_API_URL: https://staging.hex.pm/api
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  exchange:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: T4 unconfigured workflow is refused
+        run: |
+          . scripts/wi.sh
+          oidc o; exchange package:hexpm/wi_e2e_public o t; expect 403 access_denied "No matching workload identity"

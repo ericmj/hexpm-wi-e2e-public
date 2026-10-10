@@ -1,0 +1,13 @@
+name: other-caller
+
+on: workflow_dispatch
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  call:
+    uses: ./.github/workflows/_exchange.yml
+    with:
+      expect: "403"

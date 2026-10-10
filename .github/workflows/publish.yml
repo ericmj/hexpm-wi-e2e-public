@@ -1,0 +1,153 @@
+name: publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [publish, revoke]
+        default: publish
+  pull_request:
+  pull_request_target:
+  workflow_run:
+    workflows: [ping]
+    types: [completed]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  HEX_API_URL: https://staging.hex.pm/api
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'publish'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - id: v
+        run: echo "version=0.1.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+      - name: T1 publish with Mix
+        env:
+          PKG_VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          mix hex.publish package --yes 2>&1 | tee publish.log
+          grep -q "Authenticated with Workload Identity" publish.log
+      - name: T1 release metadata and tarball
+        env:
+          V: ${{ steps.v.outputs.version }}
+        run: |
+          curl -fsS "$HEX_API_URL/packages/wi_e2e_public/releases/$V" > release.json
+          jq '{publisher, oidc_claims}' release.json
+          jq -e --arg sha "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" '
+            .publisher == null
+            and .oidc_claims.repository == "ericmj/hexpm-wi-e2e-public"
+            and (.oidc_claims.workflow_ref | endswith("/.github/workflows/publish.yml@refs/heads/main"))
+            and .oidc_claims.sha == $sha
+            and (.oidc_claims.run_id | tostring) == $run' release.json
+          for _ in $(seq 1 24); do
+            s=$(curl -s -o /dev/null -w '%{http_code}' "https://repo.staging.hex.pm/tarballs/wi_e2e_public-$V.tar")
+            echo "tarball $s"
+            [ "$s" = 200 ] && exit 0
+            sleep 5
+          done
+          exit 1
+
+  checks:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'publish'
+    needs: publish
+    runs-on: ubuntu-latest
+    env:
+      V: ${{ needs.publish.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - name: T8 replay
+        run: |
+          . scripts/wi.sh
+          oidc o1
+          exchange package:hexpm/wi_e2e_public o1 t1; expect 200
+          cp t1.token "$RUNNER_TEMP/token"
+          exchange package:hexpm/wi_e2e_public o1 t1b; expect 400 invalid_grant "OIDC token has already been used"
+      - name: T2 docs upload
+        run: |
+          . scripts/wi.sh
+          mkdir -p "$RUNNER_TEMP/docs"
+          echo "<h1>wi_e2e_public $V</h1>" > "$RUNNER_TEMP/docs/index.html"
+          tar -czf docs.tar.gz -C "$RUNNER_TEMP/docs" .
+          api POST "/packages/wi_e2e_public/releases/$V/docs" "$RUNNER_TEMP/token" docs.tar.gz; expect 201
+      - name: T7 other API endpoints
+        run: |
+          . scripts/wi.sh
+          api GET /users/me "$RUNNER_TEMP/token"; expect 403
+          api GET "/auth?domain=api" "$RUNNER_TEMP/token"; expect 403
+      - name: T6 publish another package with the token
+        run: |
+          . scripts/wi.sh
+          sed -i 's/app: :wi_e2e_public,/app: :wi_e2e_public_other,/' mix.exs
+          PKG_VERSION=0.1.0 mix hex.build -o other.tar
+          git checkout mix.exs
+          api POST /publish "$RUNNER_TEMP/token" other.tar; expect 401
+      - name: T9 prod audience
+        run: |
+          . scripts/wi.sh
+          oidc o9 hexpm
+          exchange package:hexpm/wi_e2e_public o9 r9; expect 400 invalid_grant "Invalid OIDC token"
+      - name: T10 unknown package
+        run: |
+          . scripts/wi.sh
+          oidc o10
+          exchange package:hexpm/wi_e2e_nonexistent o10 r10; expect 403 access_denied "No matching workload identity"
+      - name: T11 scope syntax
+        run: |
+          . scripts/wi.sh
+          oidc o11
+          exchange package:wi_e2e_public o11 r11; expect 400 invalid_scope
+          exchange "package:hexpm/wi_e2e_public repository:wi_e2e" o11 r11b; expect 400 invalid_scope
+
+  revoke:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'revoke'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: T12 delete the identity while a job holds its token
+        run: |
+          . scripts/wi.sh
+          V=$(curl -fsS "$HEX_API_URL/packages/wi_e2e_public" | jq -r '.releases[0].version')
+          mkdir -p "$RUNNER_TEMP/docs"
+          echo "<h1>wi_e2e_public $V</h1>" > "$RUNNER_TEMP/docs/index.html"
+          tar -czf docs.tar.gz -C "$RUNNER_TEMP/docs" .
+          oidc o; exchange package:hexpm/wi_e2e_public o t; expect 200
+          api POST "/packages/wi_e2e_public/releases/$V/docs" t.token docs.tar.gz; expect 201
+          wait_for_proceed
+          api POST "/packages/wi_e2e_public/releases/$V/docs" t.token docs.tar.gz; expect 401
+          oidc o2; exchange package:hexpm/wi_e2e_public o2 t2; expect 403 access_denied "No matching workload identity"
+
+  pr:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: T11b pull_request is accepted
+        run: |
+          . scripts/wi.sh
+          oidc o; exchange package:hexpm/wi_e2e_public o t; expect 200
+
+  event-refused:
+    if: github.event_name == 'pull_request_target' || github.event_name == 'workflow_run'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: T11b ${{ github.event_name }} is refused
+        run: |
+          . scripts/wi.sh
+          oidc o; exchange package:hexpm/wi_e2e_public o t
+          expect 400 invalid_grant "OIDC tokens from pull_request_target and workflow_run workflows are not accepted"
